@@ -93,6 +93,9 @@ be any Lisp object.")
 (defvar p-search-default-candidate-generators '()
   "List of candidate generators to be applied on startup of p-search session.")
 
+(defvar p-search-prior-templates '()
+  "List of prior templates known to p-search system.")
+
 
 
 ;;; Session Vars
@@ -117,6 +120,15 @@ Elements are of the type (DOC-ID PROB).")
 
 (defvar-local p-search--section-level 0
   "Variable used to determine leveling of nested sections.")
+
+(defvar-local p-search-top-n 5
+  "Number of results to display in p-search buffer.")
+
+(defvar-local p-search-observations nil
+  "Hash table of observiations.")
+
+(defvar-local p-search-marginal nil
+  "Hash table of observiations.")
 
 
 ;;; Faces
@@ -243,7 +255,7 @@ Maps from file name to result indicator.")
 
 ;;; Documentizer
 
-;; A document in p-seach is an alist of information retrieval (IR) properties.
+;; A document in p-search is an alist of information retrieval (IR) properties.
 ;; An example of a document is as follows:
 ;;
 ;; ((id . (book . "123")) (title . "Othello") (content . "...."))
@@ -258,7 +270,7 @@ Maps from file name to result indicator.")
   (let* ((funcs (gethash type p-search-documentizer-functions))
          (newelt (cons property-symbol function)))
     (if (alist-get property-symbol funcs)
-        (setf (alist-get property-symbol funcs) newelt)
+        (setf (alist-get property-symbol funcs) (cdr newelt))
       (push newelt funcs))
     (puthash type funcs p-search-documentizer-functions)))
 
@@ -270,10 +282,6 @@ Maps from file name to result indicator.")
       (let* ((property-fetcher (lambda () (funcall function element))))
         (push (cons prop-id property-fetcher) results)))
     (nreverse results)))
-
-(defun p-search-get-document-property (document property-id)
-  "Return property PROPERTY-ID of DOCUMENT."
-  (alist-get property-id document))
 
 (p-search-def-property 'buffer 'title #'buffer-name)
 (p-search-def-property 'buffer 'file-name #'buffer-file-name)
@@ -302,6 +310,10 @@ Maps from file name to result indicator.")
 
 (defun p-search-document-property (document property)
   "Return PROPERTY of DOCUMENT."
+  (unless (consp (car document))
+    ;; document is an ID, fetch corresponding document
+    (let* ((candidates (p-search-candidates)))
+      (setq document (gethash document candidates))))
   (let ((elt (assoc property document)))
     (when elt
       (pcase-let ((`(_ . ,val) elt))
@@ -311,14 +323,17 @@ Maps from file name to result indicator.")
               res)
           val)))))
 
-(defun p-search-candidates-with-property (property)
-  "Return hashmap of documents with non-nil PROPERTY."
+(defun p-search-candidates-with-properties (properties)
+  "Return hashmap of documents with non-nil PROPERTIES."
   (let* ((documents (p-search-candidates))
          (res-hashmap (make-hash-table :test 'equal)))
     (maphash
      (lambda (id document)
-       (let* ((val (p-search-document-property document property)))
-         (when val
+       (catch 'not-applicable
+         (when (seq-every-p
+                (lambda (prop)
+                  (p-search-document-property document prop))
+                properties)
            (puthash id document res-hashmap))))
      documents)
     res-hashmap))
@@ -413,7 +428,7 @@ Maps from file name to result indicator.")
    :initialize-function
    (lambda (args)
      (let* ((title (alist-get 'title args))
-            (documents (p-search-candidates-with-property 'title)))
+            (documents (p-search-candidates-with-properties '(title))))
        (maphash
         (lambda (_ document)
           (let* ((doc-title (p-search-document-property document 'title)))
@@ -496,7 +511,7 @@ Maps from file name to result indicator.")
 ;; 0.7 to file "/tests/a.el", but the user doesn't think this test is
 ;; that important, its probability shifts closer to 0.5, while if the
 ;; user thought that the test was vital, then it would shift closer to
-;; 1.0.  This transformation is done via the BetaI function.
+;; 1.0.  This transformation currently is done via the BetaI function.
 ;;
 ;; After the prior distribution is calculated, the final posterior is
 ;; calculated based on the users observations.  A user can mark files
@@ -506,44 +521,259 @@ Maps from file name to result indicator.")
 ;; exist, with more work-intensive observations reducing the documents
 ;; probability more than shorter observations.
 
+(defun p-search--create-heap (&optional size)
+  "Return a heap that has a sort first on probability, then on name.
+If SIZE is provided create the heap with this size."
+  (make-heap (lambda (a b) (if (= (cadr a) (cadr b))
+                               (string> (format "%s" (car a)) (format "%s" (car b)))
+                             (> (cadr a) (cadr b))))
+             size))
 
+(defun p-search-prior-modified-p (p importance)
+  ;; TODO
+  p)
 
+(defun p-search-calculate (&optional no-reprint)
+  "Calculate the posterior probabilities of all search candidates.
+If NO-REPRINT is nil, don't redraw p-search buffer."
+  (message "--- p-search-calculate")
+  (let* ((documents (p-search-candidates))
+         (priors p-search-priors)
+         (marginal-p 0.0)
+         (res (p-search--create-heap (hash-table-size documents))))
+    (setq p-search-posterior-probs res)
+    (maphash
+     (lambda (id _)
+       (let* ((probability 1.0))
+         (dolist (prior priors)
+           (let* ((prior-results (p-search-prior-results prior))
+                  (default-result (or (gethash :default prior-results)
+                                      'neutral))
+                  (importance (alist-get 'importance (p-search-prior-arguments prior) 'medium))
+                  (complement (alist-get 'complement (p-search-prior-arguments prior) 'medium))
+                  (doc-result (gethash id prior-results default-result))
+                  (prior-p (p-search-prior-modified-p doc-result importance)))
+             (when complement
+               (setq prior-p (- 1.0 prior-p)))
+             (setq probability (* probability prior-p))))
+         (setq probability (* probability (gethash id p-search-observations 1.0)))
+         (heap-add res (list id probability))
+         (cl-incf marginal-p probability)))
+     documents)
+    (setq p-search-marginal marginal-p)
+    (unless no-reprint
+      (p-search--reprint))
+    res))
+
+(defun p-search-top-results ()
+  "Return the top results of the posterior probs."
+  (when p-search-posterior-probs
+    (let* ((elts '()))
+      (dotimes (i p-search-top-n)
+        (let* ((newelt (heap-delete-root p-search-posterior-probs)))
+          (push newelt elts)))
+      (setq elts (nreverse elts))
+      (setq elts (seq-filter #'identity elts))
+      (dolist (elt elts)
+        (heap-add p-search-posterior-probs elt))
+      elts)))
 
 
-;;; p-search Major Mode
+;;; Transient Integration
 
-;; This section contains the machinery for the p-search major mode.
-;; The p-search major mode is for interacting with a search session.  The user
-;; should be able to see an overview of what's being searched for and the
-;; various priors being applied.  The p-search major mode is also used for
-;; interacting with the various search results.
+;; The main vehicle for interacting with priors is transitent.
+;; Transient is the key which allows for easy configuration of the
+;; information retrieval system's parameters.  Due to the generic
+;; nature of the search system the various transient menus are created
+;; at runtime.
 
-(defun p-search--add-candidate-generator (generator args)
-  "Append GENERATOR with ARGS to the current p-search session."
-  ;; Ensure that there is an alist entry in ARGS for every item in
-  ;; input-spec of generator.
-  (pcase-dolist (`(,key . _) (p-search-candidate-generator-input-spec generator))
-    (unless (alist-get key args)
-      (error "Unable to create candidate generator %s, missing arg %s"
-             (p-search-candidate-generator-name generator)
-             key)))
-  (setq p-search-candidates-cache nil)
-  (setq p-search-candidate-generators
-        (append p-search-candidate-generators
-                (list (cons generator args)))))
+(defun p-search-relevant-prior-templates ()
+  "Return a list of prior templates which can apply to search candidates."
+  (let* ((res '()))
+    (dolist (template p-search-prior-templates)
+      (let* ((reqs (p-search-prior-template-required-properties template))
+             (applicable-docs (p-search-candidates-with-properties reqs)))
+        (when applicable-docs
+          (push template res))))
+    (setq res (nreverse res))
+    res))
 
-(defun p-search-initialize-session-variables ()
-  "Instantiate the session-specific local variables."
-  ;; (setq p-search-observations (make-hash-table :test 'equal))
-  (setq p-search-candidates-cache nil)
-  (setq p-search-candidate-generators nil)
-  (setq p-search-priors nil)
-  (setq p-search-active-prior nil))
+(defun p-search-transient-dispatcher () "Placeholder for transient dispatch.")
 
-(defun p-search--setup-candidate-generators ()
-  "Setup initial candidate generators for session."
-  ;; TODO: figure out how I want the user to specify desired initial priors.
-  (p-search--add-candidate-generator p-search-candidate-generator-buffers '()))
+(defun p-search-dispatch-transient (&rest config)
+  "Dispatch an ad-hoc transient from CONFIG.
+CONFIG should be provided simmilar to how `transient-define-prefix' is used."
+  (pcase-let ((name 'p-search-transient-dispatcher)
+              (`(,_class ,_slots ,suffixes ,_docstr ,_body)
+               (transient--expand-define-args config nil)))
+    (defalias 'p-search-transient-dispatcher
+      (lambda ()
+        (interactive)
+        (transient-setup 'p-search-transient-dispatcher)))
+    (put name 'transient--prefix
+         (transient-prefix :command name))
+    (put name 'transient--layout
+         (seq-map 'eval (cl-mapcan (lambda (s) (transient--parse-child name s))
+                                   suffixes)))
+    (call-interactively name)))
+
+(defun p-search--unique-prefix (elt elts)
+  "Return a unique key prefix string for ELT compared to ELTS."
+  (when (= (length elts) 1)
+    (setq elts (cons "" elts)))
+  (let* ((elts (seq-remove (lambda (x) (equal x elt)) elts))
+         (normalize (lambda (str) (thread-last str
+                                               downcase
+                                               (string-replace "-" "")
+                                               (string-replace " " ""))))
+         (normalized-elt (funcall normalize elt))
+         (normalized-elts (seq-map normalize elts))
+         (prefix))
+    (catch 'found
+      (dotimes (i (length normalized-elt))
+        (let* ((p (substring normalized-elt 0 i)))
+          (when (not (seq-some (lambda (other-elt)
+                                 (string-prefix-p p other-elt))
+                               normalized-elts))
+            (setq prefix p)
+            (throw 'found prefix)))))
+    (string-join (seq-map #'string (seq-into prefix 'list)) " ")))
+
+(defun p-search-dispatch-add-prior (template)
+  "Dispatch transient menu for prior template TEMPLATE."
+  (let* ((input (p-search-prior-template-input-spec template))
+         (options (p-search-prior-template-options-spec template)))
+    (apply #'p-search-dispatch-transient
+           '(["Input"
+              ("b n" "buffer name"
+               (lambda ()
+                 (interactive)))
+              ("b m" "buffer major mode"
+               (lambda ()
+                 (interactive)))]
+             ["Options"
+              ("-c" "complement"
+                 p-search--toggle-infix
+                 :init-state nil
+                 :option-symbol complement)
+              ("-i" "importance"
+                 p-search--choices-infix
+                 :choices ,p-search-importance-levls
+                 :init-choice medium
+                 :option-symbol importance)]
+             ["Actions"
+              ("c" "create"
+               (lambda ()
+                 (interactive)))]))))
+
+(defun p-search-dispatch-select-prior ()
+  "Dispatch transient menu for items in PRIOR-TEMPLATES."
+  (let* ((prior-templates (p-search-relevant-prior-templates))
+         (all-group-names (seq-map (lambda (tmpl)
+                                     (symbol-name (p-search-prior-template-group tmpl)))
+                                   prior-templates))
+         (grouped-priors (seq-map
+                          (lambda (group+templates)
+                            (let* ((templates (cdr group+templates))
+                                   (template-names (seq-map #'p-search-prior-template-name templates))
+                                   (group (car group+templates))
+                                   (group-name (symbol-name group)))
+                              ;; example of the format we're trying to put the data in:
+                              ;; [["Buffer"
+                              ;;   ("b n" "buffer name"
+                              ;;    (lambda () (interactive) (myfunc)))]]
+                              (vector
+                               (seq-into
+                                `(,group-name
+                                  ,@(seq-map
+                                     (lambda (template)
+                                       (list (concat (p-search--unique-prefix
+                                                      group-name
+                                                      all-group-names)
+                                                     " "
+                                                     (p-search--unique-prefix
+                                                      (p-search-prior-template-name template)
+                                                      template-names))
+                                             (p-search-prior-template-name template)
+                                             `(lambda ()
+                                                (interactive)
+                                                (message "dispatching %s"
+                                                         ,(p-search-prior-template-name template))
+                                                (p-search-dispatch-add-prior
+                                                 ,template))))
+                                     templates))
+                                'vector))))
+                          (seq-group-by
+                           #'p-search-prior-template-group
+                           prior-templates))))
+    (apply #'p-search-dispatch-transient grouped-priors)))
+
+
+;;; p-search sections
+
+(defun p-search-deepest-section-overlays-at-point ()
+  "Return the overlay at POSITION with the highest section level."
+  (let* ((deepest nil)
+         (deepest-level -1)
+         (ovs (overlays-at (point))))
+    (dolist (ov ovs)
+      (let ((lvl (overlay-get ov 'p-search-section-level)))
+        (when (and lvl (> lvl deepest-level))
+          (setq deepest-level lvl)
+          (setq deepest ov))))
+    deepest))
+
+(defun p-search-occlude-section (overlay)
+  "Occlude a toggable section of OVERLAY."
+  (unless (overlay-get overlay 'p-search-section-level)
+    (error "Overlay not a section"))
+  (overlay-put overlay 'p-search-section-hidden t)
+  (overlay-put overlay 'before-string
+               (propertize " " 'display '(left-fringe magit-fringe-bitmap>)))
+  (let* ((ov-start (overlay-start overlay))
+         (eol-ov-start (save-excursion (goto-char ov-start) (pos-eol)))
+         (occ-ov-start (1+ eol-ov-start))
+         (ov-end (overlay-end overlay))
+         (occ-ov (make-overlay occ-ov-start ov-end)))
+    (overlay-put occ-ov 'invisible t)
+    (overlay-put overlay 'p-search-occluding-overlay occ-ov)
+    ;; TODO: condenced text
+    ;; (when-let* ((condenced-string (p-search-short-info-string-from-overlay overlay))
+    ;;             (info-ov (make-overlay ov-start eol-ov-start)))
+    ;;   (overlay-put info-ov 'after-string (p-search-short-info-string-from-overlay overlay))
+    ;;   (overlay-put overlay 'p-search-info-overlay info-ov))
+    (goto-char ov-start)))
+
+(defun p-search-reveal-section (overlay)
+  "Reveal the contents of OVERLAY."
+  (unless (overlay-get overlay 'p-search-section-level)
+    (error "Overlay not a section"))
+  (overlay-put overlay 'p-search-section-hidden nil)
+  (overlay-put overlay 'before-string
+               (propertize " " 'display '(left-fringe magit-fringe-bitmapv)))
+  (let* ((occ-ov (overlay-get overlay 'p-search-occluding-overlay))
+         (info-ov (overlay-get overlay 'p-search-info-overlay)))
+    (unless occ-ov
+      (error "Unable to find occluding/info overlay"))
+    (delete-overlay occ-ov)
+    (when info-ov
+      (delete-overlay info-ov))))
+
+(defun p-search-add-section-overlay (start end &optional props key)
+  "Add overlay to indicate collapsible section from START to END.
+PROPS are additional properties to put on the overlay.  KEY is the
+value of the overlay property p-search-key."
+  (let ((ov (make-overlay start end)))
+    (when key
+      (overlay-put ov 'p-search-key key))
+    (overlay-put ov 'p-search-section-level p-search--section-level)
+    (overlay-put ov 'before-string
+                   (propertize " " 'display '(left-fringe magit-fringe-bitmapv)))
+    (while props
+      (let ((k (car props))
+            (v (cadr props)))
+        (overlay-put ov k v)
+        (setq props (cddr props))))))
 
 (defmacro p-search-add-section (section-name &rest body)
   "Insert a collapsable section at the point with heading SECTION-NAME.
@@ -572,61 +802,194 @@ the heading to the point where BODY leaves off."
                                        (or ,key (and (stringp ,section-name)
                                                      ,section-name)))))))
 
-(defun p-search--insert-candidate-generator (generator-args)
-  "Insert candidate generator args cons GENERATOR-ARGS into current buffer."
+
+;;; p-search Major Mode Display
 
-  )
+;; This section contains the machinery for the p-search major mode.
+;; The p-search major mode is for interacting with a search session.  The user
+;; should be able to see an overview of what's being searched for and the
+;; various priors being applied.  The p-search major mode is also used for
+;; interacting with the various search results.
+
+(defun p-search--add-candidate-generator (generator args)
+  "Append GENERATOR with ARGS to the current p-search session."
+  ;; Ensure that there is an alist entry in ARGS for every item in
+  ;; input-spec of generator.
+  (pcase-dolist (`(,key . _) (p-search-candidate-generator-input-spec generator))
+    (unless (alist-get key args)
+      (error "Unable to create candidate generator %s, missing arg %s"
+             (p-search-candidate-generator-name generator)
+             key)))
+  (setq p-search-candidates-cache nil)
+  (setq p-search-candidate-generators
+        (append p-search-candidate-generators
+                (list (cons generator args)))))
+
+(defun p-search-initialize-session-variables ()
+  "Instantiate the session-specific local variables."
+  ;; (setq p-search-observations (make-hash-table :test 'equal))
+  (setq p-search-observations (make-hash-table :test #'equal))
+  (setq p-search-candidates-cache nil)
+  (setq p-search-candidate-generators nil)
+  (setq p-search-priors nil)
+  (setq p-search-active-prior nil))
+
+(defun p-search--setup-candidate-generators ()
+  "Setup initial candidate generators for session."
+  ;; TODO: figure out how I want the user to specify desired initial priors.
+  (p-search--add-candidate-generator p-search-candidate-generator-buffers '()))
+
+(defun p-search--display-columns ()
+  "Return a list of two numbers: the start of column 2 and the end of column 2."
+  (let* ((body-width (window-body-width))
+         (page-width (min 100 body-width)))
+    (list
+     page-width
+     (- page-width 12))))
+
+(defun p-search--args-to-string (input-spec options-spec args)
+  "Return a string representing ARGS.
+Use INPUT-SPEC and OPTIONS-SPEC for information on how to format
+values of ARGS."
+  (if (not args)
+      ""
+    (let* ((str ""))
+      (string-join
+       (seq-map
+        (pcase-lambda (`(,arg-sym . ,val))
+          (format "%s: %s" arg-sym val))
+        args)
+       ", "))))
+
+(defun p-search--insert-candidate-generator (generator+args)
+  "Insert candidate generator args cons GENERATOR-ARGS into current buffer."
+  (pcase-let* ((`(,generator . ,args) generator+args))
+    (let* ((gen-name (p-search-candidate-generator-name generator))
+           (in-spec (p-search-candidate-generator-input-spec generator))
+           (opt-spec (p-search-candidate-generator-options-spec generator))
+           (args-string (p-search--args-to-string in-spec opt-spec args)))
+      (insert gen-name " "  "\n"))
+    (insert "\n")))
 
 (defun p-search--insert-prior (prior)
-  "Insert PRIOR into current buffer.")
+  "Insert PRIOR into current buffer."
+  (insert "  ... priors here ...\n"))
 
 (defun p-search--insert-results ()
   "Insert the search results into current buffer."
+  (when (not p-search-posterior-probs)
+    (insert "no results calculated...\n"))
   (when p-search-posterior-probs
-    (let* ((elts '()))
-      ())))
+    (let* ((top-results (p-search-top-results))
+           (page-dims (p-search--display-columns)))
+      (p-search-add-section
+          `((heading . ,(propertize
+                         (format "Search Results (%d)" (heap-size p-search-posterior-probs))
+                         'face 'p-search-section-heading))
+            (props . (p-search-results t))
+            (key . p-search-results-header))
+        (pcase-dolist (`(,document ,p) top-results)
+          (let* ((doc-title (p-search-document-property document 'title))
+                 (heading-line-1 (concat
+                                  (substring (propertize doc-title 'face 'p-search-header-line-key)
+                                             (max (- (length doc-title) (cadr page-dims))
+                                                  0))))
+                 (heading-line (concat
+                                heading-line-1
+                                (make-string (- (cadr page-dims) (length heading-line-1)) ?\s)
+                                (format "%.10f" (/ p p-search-marginal))))) ;; TODO Divide by marginal prob
+            ;; TODO: figure out what to do with too long names
+            (p-search-add-section `((heading . ,heading-line)
+                                    (props . (p-search-result ,document))
+                                    (key . ,doc-title))
+              (insert " .................\n")
+              (insert " ...result here...\n")
+              (insert " .................\n"))))))))
 
 (defun p-search--reprint ()
   "Redraw the current buffer from the session's state."
   (unless (derived-mode-p 'p-search-mode)
     (error "Unable to print p-search state of buffer not in p-search-mode"))
-  (let* ((inhibit-read-only t)
-         (at-line (line-number-at-pos)))
+  (let* ((inhibit-read-only t))
     ;; TODO - occlusion states
     (erase-buffer)
-    (p-search-add-section "Candidate Generators"
+    (p-search-add-section
+        `((heading . ,(propertize (format "Candidate Generators (%d)"
+                                          (length p-search-candidate-generators))
+                                  'face 'p-search-section-heading)))
       (dolist (generator-args p-search-candidate-generators)
         (p-search--insert-candidate-generator generator-args)))
-    (p-search-add-section "Priors"
+    (p-search-add-section `((heading . ,(propertize (format "Priors (%d)" (length p-search-priors))
+                                                    'face 'p-search-section-heading)))
+      (unless p-search-priors
+        (insert (propertize "No priors currently being applied.
+Press \"a\" to add new search criteria.\n" 'face 'shadow)))
       (dolist (prior p-search-priors)
         (p-search--insert-prior prior)))
     ;; TODO - Toggle occluded sections
+    (insert "\n")
     (p-search--insert-results)))
 
 (defun p-search-setup-buffer ()
   "Initial setup for p-search buffer."
   (let* ((buffer (generate-new-buffer "p-search")))
     (with-current-buffer buffer
-      (p-search-mode))
+      (p-search-mode)
+      (p-search-initialize-session-variables))
     (let ((win (display-buffer buffer nil)))
       (select-window win))
     (with-current-buffer buffer
       (p-search--setup-candidate-generators)
-      (p-search--reprint))
+      (p-search--reprint)
+      (p-search-calculate))
     buffer))
-
-(define-derived-mode p-search-mode special-mode "p-search"
-  "Major mode for p-search."
-  :group 'p-search
-  (hack-dir-local-variables-non-file-buffer))
-
 
 
 ;;; Commands
 
+(defun p-search-toggle-section ()
+  "Toggle the visibility of the section under the point."
+  (interactive)
+  (let* ((ov (p-search-deepest-section-overlays-at-point))
+         (hidden-p (overlay-get ov 'p-search-section-hidden)))
+    (if hidden-p
+        (p-search-reveal-section ov)
+      (p-search-occlude-section ov))))
+
+(defun p-search-add-prior ()
+  "Add a new prior to the current session."
+  (interactive)
+  (unless (derived-mode-p 'p-search-mode)
+    (error "No current p-search session found"))
+  (p-search-dispatch-select-prior))
+
+(defvar p-search-mode-map
+  (let ((map (make-keymap)))
+    (suppress-keymap map t)
+    (keymap-set map "a" #'p-search-add-prior)
+    ;; (keymap-set map "e" #'p-search-edit)
+    ;; (keymap-set map "g" #'p-search-refresh-buffer)
+    ;; (keymap-set map "i" #'p-search-importance)
+    ;; (keymap-set map "k" #'p-search-kill-prior)
+    ;; (keymap-set map "n" #'p-search-obs-not-relevant)
+    ;; (keymap-set map "r" #'p-search-reinstantiate-prior)
+    (keymap-set map "<tab>" #'p-search-toggle-section)
+    ;; (keymap-set map "<return>" #'p-search-find-file)
+    ;; (keymap-set map "C-o" #'p-search-display-file)
+    ;; (keymap-set map "1" #'p-search-show-level-1)
+    ;; (keymap-set map "2" #'p-search-show-level-2)
+    ;; (keymap-set map "3" #'p-search-show-level-3)
+    map)
+  "Mode-map for p-search-mode.")
+
+(define-derived-mode p-search-mode special-mode "p-search2"
+  "Major mode for p-search."
+  :group 'p-search
+  (hack-dir-local-variables-non-file-buffer))
+
 (defun p-search ()
   "Start a p-search session."
-  (interactive)
+ (interactive)
   (p-search-setup-buffer))
 
 
@@ -651,6 +1014,21 @@ the heading to the point where BODY leaves off."
 ;; Input refers to required parameters while options refers to
 ;; optional parameters.
 
+(defun p-search-define-spec-type ()
+  )
+
+;; always have :key, :description, :default-value
+;; Input types:
+;;   memory
+;;   regexp
+;;   choice :choices
+;;   string
+;;   toggle
+
+(p-search-define-spec-type
+ 'directory-name
+ :options '(:multi-value))
+
 (defun p-search--spec-default-arguments (spec)
   "Return default input and options of SPEC as one alist."
   (let* ((res '()))
@@ -667,11 +1045,12 @@ the heading to the point where BODY leaves off."
 
 (add-to-list 'p-search-candidate-generators p-search-candidate-generator-buffers)
 (add-to-list 'p-search-candidate-generators p-search-candidate-generator-filesystem)
+(add-to-list 'p-search-prior-templates p-search-prior-major-mode)
+(add-to-list 'p-search-prior-templates p-search-prior-subdirectory)
 
 (provide 'p-search)
 
 ;;; p-search.el ends here
-;;; terraform.el ends here
 ;; Local Variables:
 ;; read-symbol-shorthands: (("p-search-" . "p-search2-"))
 ;; End:
