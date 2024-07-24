@@ -70,6 +70,16 @@
   :prefix "p-search-"
   :group 'applications)
 
+(defcustom p-search-default-search-tool
+  (cond ((executable-find "rg") :rg)
+        ((executable-find "ag") :ag)
+        (t :grep))
+  "Default tool to use when running search on filesystem."
+  :group 'p-search
+  :type '(choice (const :tag "grep" :grep)
+                 (const :tag "ag (the_silver_searcher)" :ag)
+                 (const :tag "rg (ripgrep)" :rg)))
+
 
 ;;; Consts
 
@@ -77,6 +87,10 @@
 (defconst p-search-score-neutral 0.3)
 (defconst p-search-score-no 0.3)
 (defconst p-search-importance-levels '(none low medium high critical))
+(defconst p-search-query-wildcards '((:rg . "[^\w]")
+                                     (:ag . "[^\s]")
+                                     (:grep . "[^[:space:]]"))
+  "Alist of search tool to wildcard regexp.")
 
 
 
@@ -280,6 +294,122 @@ Maps from file name to result indicator.")
 
 
 
+;;; Search Tool Interface
+
+;; External tools are used to support fast searching of files without
+;; building an index.  This section defineds an interface to work with
+;; these tools.
+
+(defun p-search--escape-term (string meta-chars)
+  "Insert escape \\ characters in STRING for all chars in META-CHARS."
+  (let* ((ret-str (make-string (* (length string) 2) 0))
+         (i 0))
+    (dotimes (j (length string))
+      (if (member (aref string j) meta-chars)
+          (progn
+            (aset ret-str i ?\\)
+            (aset ret-str (1+ i) (aref string j))
+            (cl-incf i 2))
+        (aset ret-str i (aref string j))
+        (cl-incf i)))
+    (substring ret-str 0 i)))
+
+(defun p-search--rg-escape (string)
+  "Insert escape \\ characters in STRING based on Rust's regex parser (used in rg)."
+  (p-search--escape-term string '(?\\ ?. ?+ ?\( ?\) ?| ?\[ ?\] ?\{ ?\} ?^ ?$ ?# ?& ?- ?~))) ;; ?* ?\?
+
+(defun p-search--ag-escape (string)
+  "Insert escape \\ characters in STRING based on PCRE regex pattern (used in ag)."
+  (p-search--escape-term string '(?\\ ?^ ?$ ?. ?\[ ?| ?\( ?\) ?+ ?{))) ;; ?* ?\?
+
+(defun p-search--grep-escape (string)
+  "Insert escape \\ characters in STRING based on PCRE regex pattern (used in ag)."
+  (p-search--escape-term string '(?\\ ?.)))
+
+(defun p-search--replace-wildcards (string tool)
+  "Replace wildcard character in STRING with the wildcard regex fragment.
+TOOL is used to look up the correct wildchard character."
+  (let ((wildcard (or (alist-get tool p-search-query-wildcards)
+                      "[^[:blank:]]")))
+    (let ((pos 0)
+          (new-string ""))
+      ;; Replace * with wildcard*
+      (while-let ((match (string-search "*" string pos)))
+        (when (or (zerop match) (not (eql (aref string (1- match)) ?\\)))
+          (setq new-string (concat new-string
+                                   (substring string pos match)
+                                   wildcard "*")))
+        (setq pos (1+ match)))
+      ;; replace ? with wildcard
+      (let ((string (concat new-string (substring string pos)))
+            (pos 0)
+            (new-string ""))
+        (while-let ((match (string-search "?" string pos)))
+          (when (or (zerop match) (not (eql (aref string (1- match)) ?\\)))
+            (setq new-string (concat new-string
+                                     (substring string pos match)
+                                     wildcard)))
+          (setq pos (1+ match)))
+        (concat new-string (substring string pos))))))
+
+(defun p-search-query-grep--term-regexp (string)
+  "Create a term regular expression from STRING.
+A term regex is noted for marking boundary characters."
+  (let* ((escaped-string (p-search--replace-wildcards (p-search--grep-escape string) :grep)))
+    (list (propertize (concat "\\(\\<\\|_\\)" escaped-string "\\(\\>\\|_\\)") 'p-search-case-insensitive t)
+          (concat "\\B"
+                  (capitalize (substring escaped-string 0 1))
+                  (substring escaped-string 1)))))
+
+(defun p-search-query-rg--term-regexp (string)
+  "Create a term regular expression from STRING.
+A term regex is noted for marking boundary characters."
+  (let* ((escaped-string (p-search--replace-wildcards (p-search--rg-escape string) :rg)))
+    (list (propertize (concat "(\\b|_)" escaped-string "(\\b|_)") 'p-search-case-insensitive t)
+          (concat "[a-z]" ;; TODO - use not-in-word-boundary instead
+                  (capitalize (substring escaped-string 0 1))
+                  (substring escaped-string 1))))) ;; TODO - will these double-count camel case?
+
+(defun p-search-query-ag--term-regexp (string)
+  "Create a term regular expression from STRING for ag tool.
+A term regex is noted for marking boundary characters."
+  (let* ((escaped-string (p-search--replace-wildcards (p-search--ag-escape string) :ag)))
+    (list (propertize (concat "(\\b|_)" escaped-string "(\\b|_)") 'p-search-case-insensitive t)
+          (concat "[a-z]" ;; TODO - use not-in-word-boundary instead
+                  (capitalize (substring escaped-string 0 1))
+                  (substring escaped-string 1)))))
+
+(defun p-search-query-emacs--term-regexp (string)
+  "Create a term regular expression from STRING.
+A term regex is noted for marking boundary characters."
+  (list (propertize (p-search--replace-wildcards (concat "\\<" string "\\>") :emacs) 'p-search-case-insensitive t)
+        (concat (capitalize (substring string 0 1))
+                (substring string 1))))
+
+(defun p-search-query-grep--command (term)
+  "Return command line arguments for rg search of TERM."
+  (let ((case-insensitive-p (get-text-property 0 'p-search-case-insensitive term)))
+    `("grep" "-r" "-c" ,@(and case-insensitive-p '("--ignore-case")) ,term ".")))
+
+(defun p-search-query-rg--command (term)
+  "Return command line arguments for rg search of TERM."
+  (let ((case-insensitive-p (get-text-property 0 'p-search-case-insensitive term)))
+    `("rg" "--count-matches" "--color" "never" ,@(and case-insensitive-p '("-i")) ,term)))
+
+(defun p-search-query-ag--command (term)
+  "Return command line arguments for ag search of TERM."
+  (let ((case-insensitive-p (get-text-property 0 'p-search-case-insensitive term)))
+    `("ag" "-c" "--nocolor" ,@(and case-insensitive-p '("-i")) ,term)))
+
+(defun p-search-query-commands (string tool)
+  "Return list of runnable commands from STRING based on TOOL."
+  (pcase tool
+    (:grep (seq-map #'p-search-query-grep--command (p-search-query-grep--term-regexp string))) ;; TODO
+    (:rg (seq-map #'p-search-query-rg--command (p-search-query-rg--term-regexp string)))
+    (:ag (seq-map #'p-search-query-ag--command (p-search-query-ag--term-regexp string)))
+    (_ (error "Unsupported tool `%s'" tool))))
+
+
 ;;; Documentizer
 
 ;; A document in p-search is an alist of information retrieval (IR) properties.
@@ -382,6 +512,18 @@ Maps from file name to result indicator.")
      documents)
     res-hashmap))
 
+(defun p-search-reduce-document-property (prop-key init fn)
+  "Reduce over all document properties' PROP-KEY value with FN.
+
+INIT is the initial value given to the reduce operation."
+  (let* ((x init))
+    (maphash
+     (lambda (_ doc)
+       (let ((prop-val (p-search-document-property doc prop-key)))
+         (setq x (funcall fn x prop-val))))
+     (p-search-candidates))
+    x))
+
 (defun p-search-unique-candidate-properties (property)
   "Return a list of unique values of PROPERTY across the search candidates."
   '())
@@ -436,14 +578,19 @@ Maps from file name to result indicator.")
 (defconst p-search-candidate-generator-filesystem
   (p-search-candidate-generator-create
    :name "FILESYSTEM"
-   :input-spec '((base-directory . (p-search-infix-directory
+   :input-spec `((base-directory . (p-search-infix-directory
                                     :key "d"
                                     :description "Directories"
                                     :default-value (lambda () default-directory)))
                  (filename-regexp . (p-search-infix-regexp
                                      :key "f"
                                      :description "Filename Pattern"
-                                     :default-value ".*")))
+                                     :default-value ".*"))
+                 (search-tool . (p-search-infix-choices
+                                 :key "t"
+                                 :description "search tool"
+                                 :choices (:grep :rg :ag)
+                                 :default-value ,(or p-search-default-search-tool :grep))))
    :options-spec '((ignore-pattern . (p-search-infix-regexp
                                       :key "-i" ;; TODO - allow multiple (?)
                                       :description "Ignore Pattern"))
@@ -477,34 +624,38 @@ Maps from file name to result indicator.")
            (nreverse documents)))))
    :term-frequency-function
    (cl-function
-    (lambda (_args query-term callback &key _case-insensitive)
-      (let* ((file-counts (make-hash-table :test #'equal))
-             (command `("rg" "--count-matches" "--color" "never" "-i" ,query-term))
-             (buf (generate-new-buffer "*p-search rg"))
-             (parent-buffer (current-buffer)))
-        (with-current-buffer buf
-          (setq p-search-parent-session-buffer parent-buffer))
-        (make-process
-         :name "p-search-text-search"
-         :buffer buf
-         :command command
-         :sentinel
-         (lambda (proc event)
-           (when (or (member event '("finished\n" "deleted\n"))
-                     (string-prefix-p "exited abnormally with code" event)
-                     (string-prefix-p "failed with code" event))
-             (with-current-buffer (process-buffer proc)
-               (let* ((files (string-split (buffer-string) "\n")))
-                 (dolist (f files)
-                   (when (string-prefix-p "./" f)
-                     (setq f (substring f 2)))
-                   (when (string-match "^\\(.*\\):\\([0-9]*\\)$" f)
-                     (let* ((fname (match-string 1 f))
-                            (count (string-to-number (match-string 2 f))))
-                       (puthash (list 'file (file-name-concat default-directory fname)) count file-counts))))
-                 (with-current-buffer p-search-parent-session-buffer
-
-                   (funcall callback file-counts))))))))))))
+    (lambda (args query-term callback &key _case-insensitive)
+      (let* ((search-tool (alist-get 'search-tool args))
+             (file-counts (make-hash-table :test #'equal))
+             (commands (p-search-query-commands query-term search-tool))
+             (parent-buffer (current-buffer))
+             (proc-complete-ct 0))
+        (dolist (cmd commands)
+          (let* ((buf (generate-new-buffer "*p-search rg")))
+            (with-current-buffer buf
+              (setq p-search-parent-session-buffer parent-buffer))
+            (make-process
+             :name "p-search-text-search"
+             :buffer buf
+             :command cmd
+             :sentinel
+             (lambda (proc event)
+               (when (or (member event '("finished\n" "deleted\n"))
+                         (string-prefix-p "exited abnormally with code" event)
+                         (string-prefix-p "failed with code" event))
+                 (with-current-buffer (process-buffer proc)
+                   (let* ((files (string-split (buffer-string) "\n")))
+                     (dolist (f files)
+                       (when (string-prefix-p "./" f)
+                         (setq f (substring f 2)))
+                       (when (string-match "^\\(.*\\):\\([0-9]*\\)$" f)
+                         (let* ((fname (match-string 1 f))
+                                (count (string-to-number (match-string 2 f))))
+                           (puthash (list 'file (file-name-concat default-directory fname)) count file-counts))))
+                     (cl-incf proc-complete-ct)
+                     (when (= proc-complete-ct (length commands))
+                       (with-current-buffer p-search-parent-session-buffer
+                         (funcall callback file-counts)))))))))))))))
 
 ;;; Generic priors
 
@@ -581,7 +732,8 @@ Maps from file name to result indicator.")
 ;;; Search priors
 
 (defun p-search--prior-query-initialize-function (args)
-  ""
+  "Initialization function for the text query priro.
+Called with user supplied ARGS for the prior."
   (let* ((query-string (alist-get 'query-string args)))
     (p-search-query
      query-string
@@ -590,7 +742,10 @@ Maps from file name to result indicator.")
           (maphash
            (lambda (doc p)
              (p-search-set-score doc p))
-           probs))))))
+           probs)
+          (p-search-calculate)))
+     (hash-table-count (p-search-candidates))
+     (p-search-reduce-document-property 'size 0 #'+))))
 
 (defconst p-search-prior-query
   (p-search-prior-template-create

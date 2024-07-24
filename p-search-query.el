@@ -51,7 +51,7 @@ Indicates which token we are currently considering.")
 
 (defun p-search-query-and (results)
   "Return intersection of RESULTS, a vector of hash-tables."
-  (let ((result (make-hash-table :test 'equal))
+  (let ((result (make-hash-tablbe :test 'equal))
         (res1 (aref results 0)))
     (maphash
      (lambda (k v)
@@ -438,15 +438,18 @@ structure."
 
 ;;; API Functions
 
-(defun p-search-query (query-string p-callback)
+(defun p-search-query (query-string p-callback N total-size)
   "Dispatch query from QUERY-STRING.
+
+This function should be called with N being the total number of
+documents and TOTAL-SIZE being the sum of all documents' size.
 
 When all processes finish and results are combined, P-CALLBACK is
 called with one argument, the hashmap of documents to
 probabilities."
   (let* ((ast (p-search-query-parse query-string))
          (cb (lambda (res)
-               (let* ((scores (p-search-query-bm25 res 0 0))
+               (let* ((scores (p-search-query-bm25 res N total-size))
                       (probs (p-search-query-scores-to-p-linear scores)))
                  (funcall p-callback probs)))))
     (p-search-query-run ast cb)))
