@@ -524,10 +524,6 @@ INIT is the initial value given to the reduce operation."
      (p-search-candidates))
     x))
 
-(defun p-search-unique-candidate-properties (property)
-  "Return a list of unique values of PROPERTY across the search candidates."
-  '())
-
 (defun p-search-set-score (document value)
   "Set the score of DOCUMENT to VALUE."
   (unless p-search-active-prior
@@ -542,9 +538,7 @@ INIT is the initial value given to the reduce operation."
       (let* ((candidates (p-search-candidates))
              (results-ht (p-search-prior-results p-search-active-prior))
              (id (alist-get 'id document)))
-        (unless id
-          (error "Unable to get document id of %s" document))
-        (when (gethash id candidates)
+        (when (and id (gethash id candidates))
           (puthash id value results-ht))))))
 
 (defun p-search--remove-prior (prior)
@@ -552,12 +546,12 @@ INIT is the initial value given to the reduce operation."
   (setq p-search-priors (cl-remove prior p-search-priors :test #'equal))
   (p-search-calculate))
 
-(defun p-search--remove-candidate-generator (generator+args)
+(defun p-search--remove-candidate-generator (generator+args &optional no-recalc)
   "Remove GENERATOR+ARGS from the current session, recalculating posteriors."
   (setq p-search-active-candidate-generators
         (cl-remove generator+args p-search-active-candidate-generators :test #'equal))
-  (p-search-restart-calculation))
-
+  (when (not no-recalc)
+    (p-search-restart-calculation)))
 
 ;;; Predefined Priors and Candidate Generators
 
@@ -939,7 +933,6 @@ If NO-REPRINT is nil, don't redraw p-search buffer."
 ;; information retrieval system's parameters.  Due to the generic
 ;; nature of the search system the various transient menus are created
 ;; at runtime.
-
 (defun p-search--transient-suffix-from-spec (name+spec &optional always-read default-value)
   "Return a transient suffix from a NAME+SPEC cons.
 Pass value of ALWAYS-READ to transient object.  This is used for
@@ -1043,10 +1036,33 @@ This function will also start any process or thread described by TEMPLATE."
         (p-search-calculate)
       (p-search--reprint))))
 
+(defun p-search-transient-prior-edit (prior)
+  "Replace PRIOR with new version given args from transient."
+  (let* ((template (p-search-prior-template prior))
+         (args (transient-args 'p-search-transient-dispatcher))
+         (new-prior (p-search--instantiate-prior template args)))
+    (p-search--validate-prior new-prior args)
+    (setq p-search-priors (seq-map
+                           (lambda (p)
+                             (if (equal p prior)
+                                 new-prior
+                               p))
+                           p-search-priors))
+    ;; If the calculations have already been made, re-calculate
+    (if (> (hash-table-count (p-search-prior-results new-prior)) 0)
+        (p-search-calculate)
+      (p-search--reprint))))
+
 (defun p-search-transient-candidate-generator-create (generator)
   ""
   (let* ((args (transient-args 'p-search-transient-dispatcher)))
     (p-search--add-candidate-generator generator args)
+    (p-search-restart-calculation)))
+
+(defun p-search-transient-candidate-generator-edit (generator+args)
+  "Edit the candidate generator of GENERATOR+ARGS with new transient args."
+  (let* ((args (transient-args 'p-search-transient-dispatcher)))
+    (p-search--replace-candidate-generator generator+args args)
     (p-search-restart-calculation)))
 
 (defun p-search--resolve-spec (spec)
@@ -1093,6 +1109,43 @@ This function will also start any process or thread described by TEMPLATE."
                  (interactive)
                  (p-search-transient-prior-create ,template)))]))))
 
+(defun p-search-dispatch-edit-prior (prior)
+  "Dispatch transient menu for PRIOR."
+  (let* ((template (p-search-prior-template prior))
+         (args (p-search-prior-arguments prior))
+         (input-specs (p-search-prior-template-input-spec template))
+         (option-specs (p-search-prior-template-options-spec template)))
+    (apply #'p-search-dispatch-transient
+           `(["Input"
+              ,@(seq-map
+                 (lambda (name+spec)
+                   (let* ((name (car name+spec))
+                          (spec (p-search--resolve-spec (cdr name+spec)))
+                          (default-value (alist-get name args)))
+                     (p-search--transient-suffix-from-spec (cons name spec) t default-value)))
+                 input-specs)]
+             ["Options"
+              ,@(seq-map (lambda (name+spec)
+                           (let* ((name (car name+spec))
+                                  (spec (p-search--resolve-spec (cdr name+spec)))
+                                  (default-value (alist-get name args)))
+                             (p-search--transient-suffix-from-spec (cons name spec) nil default-value)))
+                         option-specs)
+              ("-c" "complement"
+               p-search-infix-toggle
+               :init-state nil
+               :option-symbol complement)
+              ("-i" "importance"
+               p-search-infix-choices
+               :choices ,p-search-importance-levels
+               :init-choice medium
+               :option-symbol importance)]
+             ["Actions"
+              ("e" "edit"
+               (lambda ()
+                 (interactive)
+                 (p-search-transient-prior-edit ,prior)))]))))
+
 (defun p-search-dispatch-add-candidate-generator (candidate-generator)
   "Dispatch transient menu for creating CANDIDATE-GENERATOR."
   (let* ((input-specs (p-search-candidate-generator-input-spec candidate-generator))
@@ -1120,6 +1173,35 @@ This function will also start any process or thread described by TEMPLATE."
                (lambda ()
                  (interactive)
                  (p-search-transient-candidate-generator-create ,candidate-generator)))]))))
+
+(defun p-search-dispatch-edit-candidate-generator (generator+args)
+  "Dispatch transient menu for editing GENERATOR+ARGS."
+  (let* ((candidate-generator (car generator+args))
+         (input-specs (p-search-candidate-generator-input-spec candidate-generator))
+         (option-specs (p-search-candidate-generator-options-spec candidate-generator)))
+    (apply #'p-search-dispatch-transient
+           `(["Input"
+              ,@(seq-map
+                 (lambda (name+spec)
+                   (let* ((name (car name+spec))
+                          (spec (p-search--resolve-spec (cdr name+spec)))
+                          (reader (oref (get (car spec) 'transient--suffix) :reader))
+                          (default-value
+                           (or (plist-get (cdr spec) :default-value)
+                            (funcall reader (format "%s:" name) nil nil))))
+                     (p-search--transient-suffix-from-spec (cons name spec) t default-value)))
+                 input-specs)]
+             ["Options"
+              ,@(seq-map (lambda (name+spec)
+                           (let* ((name (car name+spec))
+                                  (spec (p-search--resolve-spec (cdr name+spec))))
+                             (p-search--transient-suffix-from-spec (cons name spec) nil)))
+                         option-specs)]
+             ["Actions"
+              ("e" "edit"
+               (lambda ()
+                 (interactive)
+                 (p-search-transient-candidate-generator-edit (quote ,generator+args))))]))))
 
 (defun p-search-dispatch-select-prior ()
   "Dispatch transient menu for items in PRIOR-TEMPLATES."
@@ -1292,6 +1374,23 @@ the heading to the point where BODY leaves off."
   (setq p-search-active-candidate-generators
         (append p-search-active-candidate-generators
                 (list (cons generator args)))))
+
+(defun p-search--replace-candidate-generator (old-generator+args new-args)
+  "Replace OLD-GENERATOR+ARGS with NEW-ARGS."
+  (pcase-dolist (`(,key . _) (p-search-candidate-generator-input-spec (car old-generator+args)))
+    (unless (alist-get key new-args)
+      (error "Unable to create candidate generator %s, missing arg %s"
+             (p-search-candidate-generator-name (car old-generator+args))
+             key)))
+  (setq p-search-candidates-cache nil)
+  (setq p-search-candidates-by-generator nil)
+  (setq p-search-active-candidate-generators
+        (seq-map
+         (lambda (generator+args)
+           (if (equal generator+args old-generator+args)
+               (cons (car old-generator+args) new-args)
+             generator+args))
+         p-search-active-candidate-generators)))
 
 (defun p-search-initialize-session-variables ()
   "Instantiate the session-specific local variables."
@@ -1507,12 +1606,20 @@ Press \"a\" to add new search criteria.\n" 'face 'shadow)))
   (p-search-dispatch-select-prior))
 
 (defun p-search-kill-entity-at-point ()
-  ""
+  "Remove the entity at point, be it a prior or candidate generator."
   (interactive)
   (when-let* ((prior (get-char-property (point) 'p-search-prior)))
     (p-search--remove-prior prior))
   (when-let* ((prior (get-char-property (point) 'p-search-candidate-generator)))
     (p-search--remove-candidate-generator prior)))
+
+(defun p-search-edit-dwim ()
+  "Edit the entity at point, be it a prior or candidate generator."
+  (interactive)
+  (when-let* ((prior (get-char-property (point) 'p-search-prior)))
+    (p-search-dispatch-edit-prior prior))
+  (when-let* ((prior (get-char-property (point) 'p-search-candidate-generator)))
+    (p-search-dispatch-edit-candidate-generator prior)))
 
 (defun p-search-add-candidate-generator ()
   "Add a new candidate generator to the current session."
@@ -1529,7 +1636,7 @@ Press \"a\" to add new search criteria.\n" 'face 'shadow)))
          (selected-generator (alist-get selection selections nil nil #'equal)))
     (p-search-dispatch-add-candidate-generator selected-generator)))
 
-(defun p-search-add-prior-dwim ()
+(defun p-search-add-dwim ()
   "Add a new thing depending on where point is."
   (interactive)
   (unless (derived-mode-p 'p-search-mode)
@@ -1549,15 +1656,15 @@ Press \"a\" to add new search criteria.\n" 'face 'shadow)))
 (defconst p-search-mode-map
   (let ((map (make-keymap)))
     (suppress-keymap map t)
-    (keymap-set map "a" #'p-search-add-prior-dwim)
-    ;; (keymap-set map "e" #'p-search-edit)
-    (keymap-set map "c" #'p-search-add-candidate-generator)
+    (keymap-set map "a" #'p-search-add-dwim)
+    (keymap-set map "e" #'p-search-edit-dwim)
+    (keymap-set map "C" #'p-search-add-candidate-generator)
     (keymap-set map "g" #'p-search-refresh-buffer)
     ;; (keymap-set map "i" #'p-search-importance)
     (keymap-set map "k" #'p-search-kill-entity-at-point)
     ;; (keymap-set map "n" #'p-search-obs-not-relevant)
     ;; (keymap-set map "r" #'p-search-reinstantiate-prior)
-    (keymap-set map "p" #'p-search-add-prior)
+    (keymap-set map "P" #'p-search-add-prior)
     (keymap-set map "<tab>" #'p-search-toggle-section)
     ;; (keymap-set map "<return>" #'p-search-find-file)
     ;; (keymap-set map "C-o" #'p-search-display-file)
@@ -1575,7 +1682,8 @@ Press \"a\" to add new search criteria.\n" 'face 'shadow)))
   "Major mode for p-search."
   :group 'p-search
   (hack-dir-local-variables-non-file-buffer)
-  (add-hook 'post-command-hook #'p-search-post-command-hook t t))
+  (add-hook 'post-command-hook #'p-search-post-command-hook t t)
+  (setq truncate-lines t))
 
 (defun p-search ()
   "Start a p-search session."
