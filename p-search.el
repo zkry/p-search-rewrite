@@ -80,6 +80,11 @@
                  (const :tag "ag (the_silver_searcher)" :ag)
                  (const :tag "rg (ripgrep)" :rg)))
 
+(defcustom p-search-default-document-preview-size 10
+  "Default number of lines show in the results preview section."
+  :group 'p-search
+  :type 'integer)
+
 
 ;;; Consts
 
@@ -150,6 +155,9 @@ Elements are of the type (DOC-ID PROB).")
 
 (defvar-local p-search-parent-session-buffer nil
   "Stores the buffer of the p-search session used to create a child buffer.")
+
+(defvar-local p-search-document-preview-size p-search-default-document-preview-size
+  "The number of lines to show for each document preview in the current session.")
 
 
 ;;; Faces
@@ -447,7 +455,7 @@ A term regex is noted for marking boundary characters."
 
 (p-search-def-property 'buffer 'title #'buffer-name)
 (p-search-def-property 'buffer 'file-name #'buffer-file-name)
-(p-search-def-property 'buffer 'content #'buffer-string)
+(p-search-def-property 'buffer 'content (lambda (buf) (with-current-buffer buf (buffer-string))))
 (p-search-def-property 'buffer 'buffer #'identity)
 
 (p-search-def-property 'file 'title #'identity)
@@ -741,6 +749,24 @@ Called with user supplied ARGS for the prior."
      (hash-table-count (p-search-candidates))
      (p-search-reduce-document-property 'size 0 #'+))))
 
+(defun p-search--text-search-hint (prior)
+  "Mark places where the query args of PRIOR matches text in BUFFER."
+  (let* ((args (p-search-prior-arguments prior))
+         (query (alist-get 'query-string args)))
+    (p-search-mark-query
+     query
+     (lambda (query)
+       (let* ((terms (p-search-query-emacs--term-regexp query))
+              (ress '()))
+         (dolist (term terms)
+           (save-excursion
+             (goto-char (point-min))
+             (let* ((case-fold-search (get-text-property 0 'p-search-case-insensitive term)))
+               (while (search-forward-regexp term nil t)
+                 (push (cons (match-beginning 0) (match-end 0)) ress)))))
+         (setq ress (nreverse ress))
+         ress)))))
+
 (defconst p-search-prior-query
   (p-search-prior-template-create
    :group 'general
@@ -750,7 +776,8 @@ Called with user supplied ARGS for the prior."
                                   :key "q"
                                   :description "Query string")))
    :options-spec '()
-   :initialize-function #'p-search--prior-query-initialize-function))
+   :initialize-function #'p-search--prior-query-initialize-function
+   :result-hint-function #'p-search--text-search-hint))
 
 ;;; Git Priors
 
@@ -1352,13 +1379,67 @@ the heading to the point where BODY leaves off."
                                                      ,section-name)))))))
 
 
-;;; p-search Major Mode Display
+;;; Display of p-search Major Mode
 
 ;; This section contains the machinery for the p-search major mode.
 ;; The p-search major mode is for interacting with a search session.  The user
 ;; should be able to see an overview of what's being searched for and the
 ;; various priors being applied.  The p-search major mode is also used for
 ;; interacting with the various search results.
+
+(defun p-search--document-hints (p-search-priors)
+  "Return the documents hints for the current buffer."
+  (let ((hints))
+    (dolist (prior p-search-priors)
+      (let ((prior-template (p-search-prior-template prior)))
+        (when-let ((hint-func (p-search-prior-template-result-hint-function prior-template)))
+          (let ((hint-ranges (funcall hint-func prior)))
+            (setq hints (range-concat hints hint-ranges))))))
+    hints))
+
+(defun p-search--preview-from-hints (hints)
+  "Return a string from current buffer highlighting the HINTS ranges."
+  (let* ((output-string ""))
+    (pcase-dolist (`(,start . ,end) hints)
+      (add-text-properties start end '(face p-search-hi-yellow)))
+    (let* ((added-lines '()))
+      (pcase-dolist (`(,start . ,_end) hints)
+        (goto-char start)
+        (let* ((line-no (line-number-at-pos)))
+          (when (not (member line-no added-lines))
+            (let* ((line-str (buffer-substring (pos-bol) (pos-eol))))
+              (push line-no added-lines)
+              (setq output-string (concat output-string line-str "\n")))))))
+    (string-join
+     (seq-take (string-split output-string "\n") p-search-document-preview-size)
+     "\n")))
+
+(defun p-search-document-preview (document)
+  "Return preview string of DOCUMENT.
+The number of lines returned is determined by `p-search-document-preview-size'."
+  (let* ((document-contents (p-search-document-property document 'content))
+         (buffer (generate-new-buffer "*test-buffer*"))
+         (priors p-search-priors))
+    (with-current-buffer buffer
+      (insert document-contents)
+      ;; propertize buffer according to filename
+      (when (eql (car document) 'file)
+        (let ((buffer-file-name (cadr document)))
+          (set-auto-mode)))
+      (goto-char (point-min))
+      (let* ((hints (p-search--document-hints priors)))
+        (if hints
+            (progn
+              (font-lock-fontify-region (point-min) (point-max))
+              (p-search--preview-from-hints hints))
+          ;; if there are no hints, just get the first n lines
+          (let* ((start (point)))
+            (forward-line p-search-document-preview-size)
+            (font-lock-fontify-region start (point))
+            (let ((res (buffer-substring start (point))))
+              (if (eql (aref res (1- (length res))) ?\n)
+                  res
+                (concat res "\n")))))))))
 
 (defun p-search--add-candidate-generator (generator args)
   "Append GENERATOR with ARGS to the current p-search session."
@@ -1520,9 +1601,8 @@ values of ARGS."
             (p-search-add-section `((heading . ,heading-line)
                                     (props . (p-search-result ,document))
                                     (key . ,doc-title))
-              (insert " .................\n")
-              (insert " ...result here...\n")
-              (insert " .................\n"))))))))
+              (let* ((preview (p-search-document-preview document)))
+                (insert preview)))))))))
 
 (defun p-search--reprint ()
   "Redraw the current buffer from the session's state."

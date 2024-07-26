@@ -9,6 +9,8 @@
 
 (require 'cl-lib)
 
+(require 'range)
+
 (declare-function 'p-search-document-property "p-search.el")
 (declare-function 'p-search-candidate-generator-term-freq-function "p-search.el")
 (declare-function 'p-search-document-property "p-search.el")
@@ -434,6 +436,42 @@ structure."
   (let* ((tokens (p-search-query-tokenize query-string))
          (ast (p-search-query-parse-tokens tokens)))
     ast))
+
+
+;;; Mark
+
+(defun p-search--mark-query* (query mark-function)
+  "Return intervals where QUERY matches content in current buffer."
+  (pcase query
+    (`(terms . ,elts)
+     (let* ((ress '()))
+       (dolist (elt elts)
+         (let* ((res (p-search--mark-query* elt mark-function)))
+           (when res
+             (setq ress (range-concat ress res)))))
+       ress))
+    ((cl-type string)
+     (funcall mark-function query))
+    (`(and . ,elts)
+     (let* ((ress '()))
+       (dolist (elt elts)
+         (let* ((res (p-search--mark-query* elt mark-function)))
+           (when res
+             (setq ress (range-concat ress res)))))
+       ress))
+    ;; (`(near . ,elts)
+    ;;  (p-search-query-near* elts))
+    (`(not ,_elt)
+     (ignore))
+    (`(must ,elt)
+     (p-search--mark-query* elt mark-function))
+    (`(must-not ,_elt)
+     (ignore))))
+
+(defun p-search-mark-query (query mark-function)
+  "Dispatch terms of QUERY by MARK-FUNCTION to return match ranges."
+  (let* ((parsed (p-search-query-parse query)))
+    (p-search--mark-query* parsed mark-function)))
 
 
 ;;; API Functions
