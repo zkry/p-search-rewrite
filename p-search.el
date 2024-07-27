@@ -159,6 +159,9 @@ Elements are of the type (DOC-ID PROB).")
 (defvar-local p-search-document-preview-size p-search-default-document-preview-size
   "The number of lines to show for each document preview in the current session.")
 
+(defvar-local p-search-git-roots nil
+  "List of known git roots used as cache.")
+
 
 ;;; Faces
 (defgroup p-search-faces nil
@@ -296,9 +299,21 @@ Maps from file name to result indicator.")
   "Return the size of FILE-NAME in bytes."
   (nth 7 (file-attributes file-name)))
 
+(defun p-search--file-git-root (file-name)
+  "Return the git root of FILE-NAME."
+  (catch 'done
+    (dolist (root p-search-git-roots)
+      (when (string-prefix-p root file-name)
+        (throw 'done root)))
+    (let* ((default-directory (file-name-directory file-name))
+           (new-root (string-trim-right (shell-command-to-string "git rev-parse --show-toplevel"))))
+      (push new-root p-search-git-roots )
+      new-root)))
+
 (defun p-search--git-available-p ()
   "Return non-nil if git is available from default directory."
   (= (call-process "git" nil nil nil "status") 0))
+
 
 
 
@@ -462,6 +477,7 @@ A term regex is noted for marking boundary characters."
 (p-search-def-property 'file 'content #'p-search--file-text)
 (p-search-def-property 'file 'file-name #'identity)
 (p-search-def-property 'file 'size #'p-search--file-size)
+(p-search-def-property 'file 'git-root #'p-search--file-git-root)
 
 (p-search-def-property :default 'size #'p-search--size-from-content)
 
@@ -504,6 +520,17 @@ A term regex is noted for marking boundary characters."
              (default (alist-get property default-fns)))
         (when default
           (funcall default id))))))
+
+(defun p-search-unique-properties (property)
+  (let* ((candidates (p-search-candidates))
+         (values '()))
+    (maphash
+     (lambda (document _)
+       (let* ((val (p-search-document-property document property)))
+        (when (not (member val values))
+          (push val values))))
+     candidates)
+    values))
 
 (defun p-search-candidates-with-properties (properties)
   "Return hashmap of documents with non-nil PROPERTIES."
@@ -561,9 +588,8 @@ INIT is the initial value given to the reduce operation."
   (when (not no-recalc)
     (p-search-restart-calculation)))
 
+
 ;;; Predefined Priors and Candidate Generators
-
-;; This section contains pre-defined priors for searching.
 
 (defconst p-search-candidate-generator-buffers
   (p-search-candidate-generator-create
@@ -664,7 +690,7 @@ INIT is the initial value given to the reduce operation."
 (defconst p-search-prior-title
   (p-search-prior-template-create
    :group 'general
-   :name "title-name"
+   :name "title heading"
    :required-properties '(title)
    :input-spec '((title . (p-search-infix-string
                            :key "t"
@@ -679,6 +705,19 @@ INIT is the initial value given to the reduce operation."
             (when (string-search title doc-title)
               (p-search-set-score document p-search-score-yes))))
         documents)))))
+
+(defconst p-search-prior-title
+  (p-search-prior-template-create
+   :group 'general
+   :name "suffix of title"
+   :required-properties '(title)
+   :input-spec '((title . (p-search-infix-string
+                           :key "s"
+                           :description "Suffix")))
+   :initialize-function
+   (lambda (args)
+     ;; TODO
+     )))
 
 ;;; Buffer priors
 
@@ -731,6 +770,10 @@ INIT is the initial value given to the reduce operation."
                 (throw 'out nil)))))
         documents)))))
 
+(defconst p-search-prior-modification-date nil)
+
+(defconst p-search-prior-file-size nil)
+
 ;;; Search priors
 
 (defun p-search--prior-query-initialize-function (args)
@@ -781,7 +824,70 @@ Called with user supplied ARGS for the prior."
 
 ;;; Git Priors
 
-;; TODO --
+(defun p-search--available-git-authors ()
+  "Return list of all authors for current session."
+  (let* ((authors '())
+         (git-roots (p-search2-unique-properties 'git-root)))
+    (dolist (git-root git-roots)
+      (let ((default-directory git-root))
+        (setq authors (append authors (string-lines (shell-command-to-string "git log --all --format='%aN' | sort -u") t)))))
+    authors))
+
+(defun p-search--prior-git-author-initialize-function (args)
+  "Initialization function for the Git Author prior with ARGS of prior."
+  (let* ((init-buf (current-buffer))
+         (author (alist-get 'git-author args))
+         (base-directories (p-search-unique-properties 'git-root))
+         (git-command (format "git log --author=\"%s\" --name-only --pretty=format: | sort -u" author)))
+    (dolist (default-directory base-directories)
+      (let* ((buf (generate-new-buffer "*p-search-git-author*")))
+        (make-process
+         :name "p-seach-git-author-prior"
+         :buffer buf
+         :command `("sh" "-c" ,git-command)
+         :sentinel (lambda (_proc event)
+                     (when (or (member event '("finished\n" "deleted\n"))
+                               (string-prefix-p "exited abnormally with code" event)
+                               (string-prefix-p "failed with code" event))
+                       (with-current-buffer init-buf
+                         (p-search-calculate))))
+         :filter (lambda (proc string)
+                   (when (buffer-live-p (process-buffer proc))
+                     (with-current-buffer (process-buffer proc)
+                       (let ((moving (= (point) (process-mark proc))))
+                         (save-excursion
+                           (goto-char (process-mark proc))
+                           (insert string)
+                           (set-marker (process-mark proc) (point)))
+                         (if moving (goto-char (process-mark proc)))
+                         (let ((files (string-split string "\n")))
+                           (dolist (f files)
+                             ;; Following line makes git-root only for 'file documents
+                             ;; TODO: I should have a cleaner way of generating document
+                             ;;       IDs.
+                             (let ((doc-id (list 'file (file-name-concat default-directory f))))
+                               (p-search-set-score doc-id p-search-score-yes)))))))))))))
+
+(defconst p-search-prior-git-author
+  (p-search-prior-template-create
+   :group 'git
+   :name "Git Author"
+   :required-properties '(git-root)
+   :input-spec '((git-author . (p-search-infix-choices
+                                :key "a"
+                                :description "Git Author"
+                                :choices p-search--available-git-authors)))
+   :options-spec '()
+   :initialize-function #'p-search--prior-git-author-initialize-function
+   ;; :result-hint-function #'p-search--git-author-hint
+   ))
+
+(defconst p-search-prior-git-branch nil)
+
+(defconst p-search-prior-git-cochange nil)
+
+(defconst p-search-prior-git-commit-frequency nil)
+
 
 
 ;;; Queries
@@ -823,23 +929,22 @@ Called with user supplied ARGS for the prior."
 ;; need to call many processes, callbacks are heavily used.  The
 ;; program flow is as follows:
 ;;
-;;                                             call candidate generator func
+;;                                             call candidate generator funcs'
+;;                                                 term-frequency-function
 ;;
-;; search-query        ----> query-component   /--> candidate-generator \
-;;      |             /                       /                          \
-;;      | parse      /-----> query-component -----> candidate-generator   --\
-;;      v           /                         \                          /  |
-;;  query-ast -----/-------> query-component   \--> candidate-generator /   |
-;;                                          \                               |
-;;                                           ...                            |
-;;                                             /                            |
-;;                                    /--  <--/                             |
-;; merge results for final scores <------  <-------------------------------/
+;; search-query        ----> query-component   /--> candidate-generator TF \
+;;      |             /                       /                             \
+;;      | parse      /-----> query-component -----> candidate-generator TF   --\
+;;      v           /                         \                             /  |
+;;  query-ast -----/-------> query-component   \--> candidate-generator TF /   |
+;;                                          \                                  |
+;;                                           ...                               |
+;;                                             /                               |
+;;                                    /--  <--/                                |
+;; merge results for final scores <------  <----------------------------------/
 ;;       |                                   fan-in for query-component results
 ;;       |
-;;       \--> noramlize score on 0.0 to 1.0 scale ---> final result for p-search ses
-;;
-;;
+;;       \--> noramlize score on 0.0 to 1.0 scale ---> final result for p-search
 ;;
 
 
@@ -1273,7 +1378,7 @@ This function will also start any process or thread described by TEMPLATE."
     (apply #'p-search-dispatch-transient grouped-priors)))
 
 
-;;; p-search sections
+;;; Sections
 
 (defun p-search-highlight-point-section ()
   "Put a highlight property on section overlay at point."
@@ -1410,8 +1515,10 @@ the heading to the point where BODY leaves off."
             (let* ((line-str (buffer-substring (pos-bol) (pos-eol))))
               (push line-no added-lines)
               (setq output-string (concat output-string line-str "\n")))))))
-    (string-join
-     (seq-take (string-split output-string "\n") p-search-document-preview-size)
+    (concat
+     (string-join
+      (seq-take (string-split output-string "\n") p-search-document-preview-size)
+      "\n")
      "\n")))
 
 (defun p-search-document-preview (document)
@@ -1437,7 +1544,8 @@ The number of lines returned is determined by `p-search-document-preview-size'."
             (forward-line p-search-document-preview-size)
             (font-lock-fontify-region start (point))
             (let ((res (buffer-substring start (point))))
-              (if (eql (aref res (1- (length res))) ?\n)
+              (if (and (> (length res) 0)
+                       (eql (aref res (1- (length res))) ?\n))
                   res
                 (concat res "\n")))))))))
 
