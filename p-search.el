@@ -134,9 +134,6 @@ be any Lisp object.")
 (defvar-local p-search-priors nil
   "List of active prior components for search.")
 
-(defvar-local p-search-active-prior nil
-  "Dynamic variable of prior currently being acted on.")
-
 (defvar-local p-search-posterior-probs nil
   "Heap of calculated posterior probabilities.
 Elements are of the type (DOC-ID PROB).")
@@ -559,11 +556,9 @@ INIT is the initial value given to the reduce operation."
      (p-search-candidates))
     x))
 
-(defun p-search-set-score (document value)
-  "Set the score of DOCUMENT to VALUE."
-  (unless p-search-active-prior
-    (error "Ensure that initialization function is called with `p-search-active-prior' bound"))
-  (let ((results-ht (p-search-prior-results p-search-active-prior)))
+(defun p-search-set-score (prior document value)
+  "Set the score of DOCUMENT to VALUE for PRIOR."
+  (let ((results-ht (p-search-prior-results prior)))
     (if (eql document :default)
         (puthash :default value results-ht)
       (unless (consp (car document))
@@ -571,7 +566,7 @@ INIT is the initial value given to the reduce operation."
         (let* ((candidates (p-search-candidates)))
           (setq document (gethash document candidates))))
       (let* ((candidates (p-search-candidates))
-             (results-ht (p-search-prior-results p-search-active-prior))
+             (results-ht (p-search-prior-results prior))
              (id (alist-get 'id document)))
         (when (and id (gethash id candidates))
           (puthash id value results-ht))))))
@@ -696,8 +691,9 @@ INIT is the initial value given to the reduce operation."
                            :key "t"
                            :description "Document's Title")))
    :initialize-function
-   (lambda (args)
-     (let* ((title (alist-get 'title args))
+   (lambda (prior)
+     (let* ((args (p-search-prior-arguments prior))
+            (title (alist-get 'title args))
             (documents (p-search-candidates-with-properties '(title))))
        (maphash
         (lambda (_ document)
@@ -706,18 +702,25 @@ INIT is the initial value given to the reduce operation."
               (p-search-set-score document p-search-score-yes))))
         documents)))))
 
-(defconst p-search-prior-title
+(defconst p-search-prior-suffix
   (p-search-prior-template-create
    :group 'general
    :name "suffix of title"
    :required-properties '(title)
-   :input-spec '((title . (p-search-infix-string
+   :input-spec '((suffix . (p-search-infix-string
                            :key "s"
                            :description "Suffix")))
    :initialize-function
-   (lambda (args)
-     ;; TODO
-     )))
+   (lambda (prior)
+     (let* ((args (p-search-prior-arguments prior))
+            (suffix (alist-get 'suffir args))
+            (documents (p-search-candidates-with-properties '(title))))
+       (maphash
+        (lambda (_ document)
+          (let* ((doc-title (p-search-document-property document 'title)))
+            (when (string-suffix-p suffix doc-title)
+              (p-search-set-score document p-search-score-yes))))
+        documents)))))
 
 ;;; Buffer priors
 
@@ -730,16 +733,16 @@ INIT is the initial value given to the reduce operation."
                                 :key "-m"
                                 :description "Buffer major mode")))
    :initialize-function
-   (lambda (args)
-     (let* ((major-mode-sym (intern (alist-get 'major-mode args)))
+   (lambda (prior)
+     (let* ((args (p-search-prior-arguments prior))
+            (major-mode-sym (intern (alist-get 'major-mode args)))
             (documents (p-search-candidates)))
        (maphash
         (lambda (_ document)
           (let* ((buffer (p-search-document-property document 'buffer))
-                 (p-search-active-prior p-search-active-prior)
                  (ok (with-current-buffer buffer (eql major-mode-sym major-mode))))
             (when ok
-              (p-search-set-score document p-search-score-yes))))
+              (p-search-set-score prior document p-search-score-yes))))
         documents)))))
 
 ;;; File system priors
@@ -753,8 +756,9 @@ INIT is the initial value given to the reduce operation."
                                          :key "d"
                                          :description "Directories")))
    :initialize-function
-   (lambda (args)
-     (let* ((include-directory (alist-get 'include-directory args))
+   (lambda (prior)
+     (let* ((args (p-search-prior-arguments prior))
+            (include-directory (alist-get 'include-directory args))
             (directory-expanded (expand-file-name include-directory))
             (documents (p-search-candidates-with-properties '(file-name))))
        ;; TODO - When an active prior exists, p-search-candidates should *by default* only
@@ -776,19 +780,19 @@ INIT is the initial value given to the reduce operation."
 
 ;;; Search priors
 
-(defun p-search--prior-query-initialize-function (args)
+(defun p-search--prior-query-initialize-function (prior)
   "Initialization function for the text query priro.
 Called with user supplied ARGS for the prior."
-  (let* ((query-string (alist-get 'query-string args)))
+  (let* ((args (p-search-prior-arguments prior))
+         (query-string (alist-get 'query-string args)))
     (p-search-query
      query-string
-     `(lambda (probs)
-        (let ((p-search-active-prior ,p-search-active-prior))
-          (maphash
-           (lambda (doc p)
-             (p-search-set-score doc p))
-           probs)
-          (p-search-calculate)))
+     (lambda (probs)
+       (maphash
+        (lambda (doc p)
+          (p-search-set-score prior doc p))
+        probs)
+       (p-search-calculate))
      (hash-table-count (p-search-candidates))
      (p-search-reduce-document-property 'size 0 #'+))))
 
@@ -833,9 +837,10 @@ Called with user supplied ARGS for the prior."
         (setq authors (append authors (string-lines (shell-command-to-string "git log --all --format='%aN' | sort -u") t)))))
     authors))
 
-(defun p-search--prior-git-author-initialize-function (args)
-  "Initialization function for the Git Author prior with ARGS of prior."
-  (let* ((init-buf (current-buffer))
+(defun p-search--prior-git-author-initialize-function (prior)
+  "Initialization function for the Git Author prior with PRIOR."
+  (let* ((args (p-search-prior-arguments prior))
+         (init-buf (current-buffer))
          (author (alist-get 'git-author args))
          (base-directories (p-search-unique-properties 'git-root))
          (git-command (format "git log --author=\"%s\" --name-only --pretty=format: | sort -u" author)))
@@ -849,24 +854,12 @@ Called with user supplied ARGS for the prior."
                      (when (or (member event '("finished\n" "deleted\n"))
                                (string-prefix-p "exited abnormally with code" event)
                                (string-prefix-p "failed with code" event))
-                       (with-current-buffer init-buf
-                         (p-search-calculate))))
-         :filter (lambda (proc string)
-                   (when (buffer-live-p (process-buffer proc))
-                     (with-current-buffer (process-buffer proc)
-                       (let ((moving (= (point) (process-mark proc))))
-                         (save-excursion
-                           (goto-char (process-mark proc))
-                           (insert string)
-                           (set-marker (process-mark proc) (point)))
-                         (if moving (goto-char (process-mark proc)))
-                         (let ((files (string-split string "\n")))
-                           (dolist (f files)
-                             ;; Following line makes git-root only for 'file documents
-                             ;; TODO: I should have a cleaner way of generating document
-                             ;;       IDs.
-                             (let ((doc-id (list 'file (file-name-concat default-directory f))))
-                               (p-search-set-score doc-id p-search-score-yes)))))))))))))
+                       (with-current-buffer ,init-buf
+                         (let ((content (buffer-string)))
+                           (dolist (file (string-split content "\n"))
+                             (let ((doc-id (list 'file (file-name-concat default-directory file))))
+                               (p-search-set-score prior doc-id p-search-score-yes))))
+                         (p-search-calculate)))))))))
 
 (defconst p-search-prior-git-author
   (p-search-prior-template-create
@@ -882,11 +875,10 @@ Called with user supplied ARGS for the prior."
    ;; :result-hint-function #'p-search--git-author-hint
    ))
 
-(defconst p-search-prior-git-branch nil)
-
-(defconst p-search-prior-git-cochange nil)
-
 (defconst p-search-prior-git-commit-frequency nil)
+
+;; save cochange for expansions
+(defconst p-search-prior-git-cochange nil)
 
 
 
@@ -1036,11 +1028,9 @@ If NO-REPRINT is nil, don't redraw p-search buffer."
         (stop-process proc-thread))
       (when (threadp proc-thread)
         (thread-signal proc-thread nil nil)))
-    (let* ((p-search-active-prior prior)
-           (prior-template (p-search-prior-template prior))
-           (prior-args (p-search-prior-arguments prior))
+    (let* ((prior-template (p-search-prior-template prior))
            (init-func (p-search-prior-template-initialize-function prior-template))
-           (init-res (funcall init-func prior-args)))
+           (init-res (funcall init-func prior)))
       (setf (p-search-prior-proc-or-thread prior) init-res)))
   (p-search-calculate))
 
@@ -1143,8 +1133,7 @@ This function will also start any process or thread described by TEMPLATE."
                  :template template
                  :arguments args
                  :results (make-hash-table :test #'equal)))
-         (p-search-active-prior prior)
-         (init-res (funcall init-func args)))
+         (init-res (funcall init-func prior)))
     (setf (p-search-prior-proc-or-thread prior) init-res)
     prior))
 
@@ -1206,6 +1195,19 @@ This function will also start any process or thread described by TEMPLATE."
      (cl-loop for (key value) on spec-props by 'cddr
               append (list key (if (functionp value) (funcall value) value))))))
 
+(defun p-search-read-default-spec-value (name+spec)
+  (let* ((name (car name+spec))
+         (spec (p-search--resolve-spec (cdr name+spec)))
+         (prompt (format "%s:" name))
+         (reader (oref (get (car spec) 'transient--suffix) :reader)))
+    (if reader
+        (funcall reader prompt nil nil)
+      (cond
+       ;; TODO - rething how this is done
+       ((p-search--choices-p (get (car spec) 'transient--suffix))
+        (let* ((choices (plist-get (cdr spec) :choices)))
+          (intern (completing-read prompt choices nil t))))))))
+
 (defun p-search-dispatch-add-prior (template)
   "Dispatch transient menu for prior template TEMPLATE."
   (let* ((input-specs (p-search-prior-template-input-spec template))
@@ -1214,11 +1216,8 @@ This function will also start any process or thread described by TEMPLATE."
            `(["Input"
               ,@(seq-map
                  (lambda (name+spec)
-                   (let* ((name (car name+spec))
-                          (spec (p-search--resolve-spec (cdr name+spec)))
-                          (reader (oref (get (car spec) 'transient--suffix) :reader))
-                          (default-value (funcall reader (format "%s:" name) nil nil)))
-                     (p-search--transient-suffix-from-spec (cons name spec) t default-value)))
+                   (let* ((default-value (p-search-read-default-spec-value name+spec)))
+                     (p-search--transient-suffix-from-spec name+spec t default-value)))
                          input-specs)]
              ["Options"
               ,@(seq-map (lambda (name+spec)
@@ -1588,8 +1587,7 @@ The number of lines returned is determined by `p-search-document-preview-size'."
   (setq p-search-candidates-cache nil)
   (setq p-search-candidates-by-generator nil)
   (setq p-search-active-candidate-generators nil)
-  (setq p-search-priors nil)
-  (setq p-search-active-prior nil))
+  (setq p-search-priors nil))
 
 (defun p-search--setup-candidate-generators ()
   "Setup initial candidate generators for session."
@@ -1932,6 +1930,7 @@ Press \"a\" to add new search criteria.\n" 'face 'shadow)))
 (add-to-list 'p-search-prior-templates p-search-prior-title)
 (add-to-list 'p-search-prior-templates p-search-prior-subdirectory)
 (add-to-list 'p-search-prior-templates p-search-prior-query)
+(add-to-list 'p-search-prior-templates p-search-prior-git-author)
 
 (provide 'p-search)
 
