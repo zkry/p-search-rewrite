@@ -529,6 +529,20 @@ A term regex is noted for marking boundary characters."
      candidates)
     values))
 
+(defun p-search-candidate-with-properties-exists-p (properties)
+  "Return non-nil if there exists a document will all of PROPERTIES."
+  (catch 'done
+    (let* ((documents (p-search-candidates)))
+      (maphash
+       (lambda (_ document)
+         (when (seq-every-p
+                (lambda (prop)
+                  (p-search-document-property document prop))
+                properties)
+           (throw 'done t)))
+       documents)
+      nil)))
+
 (defun p-search-candidates-with-properties (properties)
   "Return hashmap of documents with non-nil PROPERTIES."
   (let* ((documents (p-search-candidates))
@@ -769,8 +783,8 @@ INIT is the initial value given to the reduce operation."
             (let* ((file-name (p-search-document-property document 'file-name))
                    (file-expanded (expand-file-name file-name)))
               (if (string-prefix-p directory-expanded file-expanded)
-                  (p-search-set-score document p-search-score-yes)
-                (p-search-set-score document p-search-score-no)
+                  (p-search-set-score prior document p-search-score-yes)
+                (p-search-set-score prior document p-search-score-no)
                 (throw 'out nil)))))
         documents)))))
 
@@ -884,15 +898,46 @@ Called with user supplied ARGS for the prior."
                                 :description "Git Author"
                                 :choices p-search--available-git-authors)))
    :options-spec '()
-   :initialize-function #'p-search--prior-git-author-initialize-function
-   ;; :result-hint-function #'p-search--git-author-hint
-   ))
+   :initialize-function #'p-search--prior-git-author-initialize-function))
 
-(defconst p-search-prior-git-commit-frequency nil)
+(defun p-search--prior-git-commit-frequency-initialize-function (prior)
+  "Initialization for git commit frequency for PRIOR."
+  (let* ((base-dirs (p-search-unique-properties 'git-root))
+         (args (p-search-prior-arguments prior))
+         (n-commits (alist-get 'n-commits args)))
+    (dolist (default-directory base-dirs)
+      (let* ((last-commits-cmd (format "git log -%d --pretty=format:\"%%H\"" n-commits))
+             (commits (string-lines (shell-command-to-string last-commits-cmd) t))
+             (file-counts (make-hash-table :test #'equal))
+             (max-count 0))
+        (dolist (commit commits)
+          (let* ((files (string-lines (shell-command-to-string (format "git show --pretty=format:\"\" --name-only %s" commit)) t)))
+            (dolist (file files)
+              ;; default of 1 for laplace smoothing
+              (let ((count (1+ (gethash file file-counts 0))))
+                (when (> count max-count)
+                  (setq max-count count))
+                (puthash file count file-counts)))))
+        (maphash
+         (lambda (file count)
+           (let* ((p (+ 0.5 (* 0.2 (/ (float count) max-count)))))
+             (p-search-set-score
+              prior
+              (list 'file (file-name-concat default-directory file))
+              p)))
+         file-counts)))
+    (p-search-set-score prior :default p-search-score-no)))
 
-;; save cochange for expansions
-(defconst p-search-prior-git-cochange nil)
-
+(defconst p-search-prior-git-commit-frequency
+  (p-search-prior-template-create
+   :name "git commit frequency"
+   :group 'git
+   :input-spec
+   '((n-commits . (p-search-infix-number
+                   :key "n"
+                   :description "Consider last N commits."
+                   :default-value 20)))
+   :initialize-function #'p-search--prior-git-commit-frequency-initialize-function))
 
 
 ;;; Queries
@@ -1090,9 +1135,8 @@ use it as the :default-value slot."
   "Return a list of prior templates which can apply to search candidates."
   (let* ((res '()))
     (dolist (template p-search-prior-templates)
-      (let* ((reqs (p-search-prior-template-required-properties template))
-             (applicable-docs (p-search-candidates-with-properties reqs)))
-        (when (> (hash-table-count applicable-docs) 0)
+      (let* ((reqs (p-search-prior-template-required-properties template)))
+        (when (p-search-candidate-with-properties-exists-p reqs)
           (push template res))))
     (setq res (nreverse res))
     res))
@@ -1211,15 +1255,17 @@ This function will also start any process or thread described by TEMPLATE."
 (defun p-search-read-default-spec-value (name+spec)
   (let* ((name (car name+spec))
          (spec (p-search--resolve-spec (cdr name+spec)))
-         (prompt (format "%s:" name))
-         (reader (oref (get (car spec) 'transient--suffix) :reader)))
-    (if reader
-        (funcall reader prompt nil nil)
-      (cond
-       ;; TODO - rething how this is done
-       ((p-search--choices-p (get (car spec) 'transient--suffix))
-        (let* ((choices (plist-get (cdr spec) :choices)))
-          (intern (completing-read prompt choices nil t))))))))
+         (default-value (plist-get (cdr spec) :default-value)))
+    (or default-value
+        (let* ((prompt (format "%s:" name))
+               (reader (oref (get (car spec) 'transient--suffix) :reader)))
+          (if reader
+              (funcall reader prompt nil nil)
+            (cond
+             ;; TODO - rething how this is done
+             ((p-search--choices-p (get (car spec) 'transient--suffix))
+              (let* ((choices (plist-get (cdr spec) :choices)))
+                (intern (completing-read prompt choices nil t))))))))))
 
 (defun p-search-dispatch-add-prior (template)
   "Dispatch transient menu for prior template TEMPLATE."
@@ -1944,6 +1990,7 @@ Press \"a\" to add new search criteria.\n" 'face 'shadow)))
 (add-to-list 'p-search-prior-templates p-search-prior-subdirectory)
 (add-to-list 'p-search-prior-templates p-search-prior-query)
 (add-to-list 'p-search-prior-templates p-search-prior-git-author)
+(add-to-list 'p-search-prior-templates p-search-prior-git-commit-frequency)
 
 (provide 'p-search)
 
