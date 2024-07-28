@@ -624,7 +624,7 @@ INIT is the initial value given to the reduce operation."
    :function
    (lambda (args)
      (let-alist args
-       (let* ((default-directory .base-directory)
+       (let* ((default-directory (expand-file-name .base-directory))
               (git-available-p (p-search--git-available-p)))
          (when (and .use-git-ignore (not git-available-p))
            (message "Cannot use git ignore for directory %s.  Falling back on all files." default-directory))
@@ -642,7 +642,7 @@ INIT is the initial value given to the reduce operation."
                  (throw 'skip nil))
                (when (and .ignore-pattern (string-match-p .ignore-pattern file))
                  (throw 'skip nil))
-               (setq file (file-name-concat default-directory file))
+               (setq file (expand-file-name (file-name-concat default-directory file)))
                (push (p-search-documentize `(file ,file)) documents)))
            (nreverse documents)))))
    :term-frequency-function
@@ -699,7 +699,7 @@ INIT is the initial value given to the reduce operation."
         (lambda (_ document)
           (let* ((doc-title (p-search-document-property document 'title)))
             (when (string-search title doc-title)
-              (p-search-set-score document p-search-score-yes))))
+              (p-search-set-score prior document p-search-score-yes))))
         documents)))))
 
 (defconst p-search-prior-suffix
@@ -719,7 +719,7 @@ INIT is the initial value given to the reduce operation."
         (lambda (_ document)
           (let* ((doc-title (p-search-document-property document 'title)))
             (when (string-suffix-p suffix doc-title)
-              (p-search-set-score document p-search-score-yes))))
+              (p-search-set-score prior document p-search-score-yes))))
         documents)))))
 
 ;;; Buffer priors
@@ -850,16 +850,29 @@ Called with user supplied ARGS for the prior."
          :name "p-seach-git-author-prior"
          :buffer buf
          :command `("sh" "-c" ,git-command)
-         :sentinel (lambda (_proc event)
+         :sentinel (lambda (proc event)
                      (when (or (member event '("finished\n" "deleted\n"))
                                (string-prefix-p "exited abnormally with code" event)
                                (string-prefix-p "failed with code" event))
-                       (with-current-buffer ,init-buf
-                         (let ((content (buffer-string)))
+                       (let* ((content (with-current-buffer (process-buffer proc) (buffer-string)))
+                              (root-dir (with-current-buffer (process-buffer proc) default-directory))
+                              (commit-counts (make-hash-table :test #'equal))
+                              (max-counts 0))
+                         (with-current-buffer init-buf
                            (dolist (file (string-split content "\n"))
-                             (let ((doc-id (list 'file (file-name-concat default-directory file))))
-                               (p-search-set-score prior doc-id p-search-score-yes))))
-                         (p-search-calculate)))))))))
+                             (when (> (length file) 0)
+                               (let ((doc-id (list 'file (file-name-concat root-dir file))))
+                                 (let ((count (1+ (gethash doc-id commit-counts 0))))
+                                   (when (> count max-counts)
+                                     (setq max-counts count))
+                                   (puthash doc-id count commit-counts)))))
+                           (maphash
+                            (lambda (doc-id count)
+                              (let ((p (+ 0.5 (* 0.2 (/ count max-counts)))))
+                                (p-search-set-score prior doc-id p)))
+                            commit-counts)
+                           (p-search-set-score prior :default p-search-score-no)
+                           (p-search-calculate))))))))))
 
 (defconst p-search-prior-git-author
   (p-search-prior-template-create
